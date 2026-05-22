@@ -1,0 +1,17 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+## База данных
+*.db
+*.db-shm
+*.db-wal
+
+## ВАЖНО: не коммитить appsettings с реальными ключами!
+appsettings.json
+
+## Логи
+*.log
