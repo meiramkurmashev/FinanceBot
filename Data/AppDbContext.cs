@@ -11,6 +11,7 @@ public class AppDbContext : DbContext
     public DbSet<Account> Accounts => Set<Account>();
     public DbSet<Category> Categories => Set<Category>();
     public DbSet<Transaction> Transactions => Set<Transaction>();
+    public DbSet<UserPattern> UserPatterns => Set<UserPattern>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -61,5 +62,24 @@ public class AppDbContext : DbContext
             .WithMany(a => a.Transactions)
             .HasForeignKey(t => t.AccountId)
             .OnDelete(DeleteBehavior.Restrict);
+
+        // UserPattern
+        modelBuilder.Entity<UserPattern>()
+            .HasOne(p => p.User)
+            .WithMany()
+            .HasForeignKey(p => p.UserTelegramId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<UserPattern>()
+            .HasOne(p => p.Category)
+            .WithMany()
+            .HasForeignKey(p => p.CategoryId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        modelBuilder.Entity<UserPattern>()
+            .HasOne(p => p.Account)
+            .WithMany()
+            .HasForeignKey(p => p.AccountId)
+            .OnDelete(DeleteBehavior.SetNull);
     }
 }

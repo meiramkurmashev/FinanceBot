@@ -25,6 +25,7 @@ builder.Services.AddSingleton<ConversationService>();
 builder.Services.AddScoped<UserService>();
 builder.Services.AddScoped<FinanceService>();
 builder.Services.AddScoped<AIService>();
+builder.Services.AddScoped<PatternService>();
 builder.Services.AddScoped<BotUpdateHandler>();
 builder.Services.AddSingleton<ScopedBotUpdateHandler>();
 

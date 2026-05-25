@@ -7,9 +7,8 @@ using System.Text.Json.Nodes;
 namespace FinanceBot.Services;
 
 /// <summary>
-/// Сервис для работы с Groq AI (Llama 3.3 + Whisper)
-/// - Текст парсит через Llama 3.3-70b
-/// - Голос транскрибирует через Whisper, затем парсит Llama
+/// Groq AI (Llama 3.3-70b + Whisper).
+/// Ключевое улучшение: получает список категорий пользователя и матчит их сам.
 /// </summary>
 public class AIService
 {
@@ -17,75 +16,84 @@ public class AIService
     private readonly string _apiKey;
     private readonly ILogger<AIService> _logger;
 
-    private const string ChatUrl = "https://api.groq.com/openai/v1/chat/completions";
+    private const string ChatUrl   = "https://api.groq.com/openai/v1/chat/completions";
     private const string WhisperUrl = "https://api.groq.com/openai/v1/audio/transcriptions";
-    private const string Model = "llama-3.3-70b-versatile";
-
-    private const string SystemPrompt =
-        "Ты — парсер финансовых транзакций для личного учёта. " +
-        "Всегда отвечай ТОЛЬКО валидным JSON без markdown, без пояснений. " +
-        "Язык сообщений: русский.";
+    private const string Model     = "llama-3.3-70b-versatile";
 
     public AIService(IConfiguration config, HttpClient http, ILogger<AIService> logger)
     {
         _logger = logger;
-        _http = http;
+        _http   = http;
         _apiKey = config["BotSettings:GroqApiKey"]
-            ?? throw new InvalidOperationException("GroqApiKey не настроен в appsettings.json");
-
+            ?? throw new InvalidOperationException("GroqApiKey не настроен");
         _http.DefaultRequestHeaders.Authorization =
             new AuthenticationHeaderValue("Bearer", _apiKey);
     }
 
     /// <summary>
-    /// Парсит текстовое сообщение → структурированная транзакция
+    /// Парсит сообщение. Передаём список категорий — AI сам матчит.
     /// </summary>
-    public async Task<ParsedTransaction?> ParseTextMessageAsync(string message)
+    public async Task<ParsedTransaction?> ParseTextMessageAsync(
+        string message,
+        IEnumerable<Category> userCategories,
+        IEnumerable<Account> userAccounts)
     {
-        var today = DateTime.Today.ToString("yyyy-MM-dd");
+        var today     = DateTime.Today.ToString("yyyy-MM-dd");
         var yesterday = DateTime.Today.AddDays(-1).ToString("yyyy-MM-dd");
 
-        var userPrompt =
-            $"Разбери это сообщение о финансовой транзакции: \"{message}\"\n\n" +
-            $"Сегодня: {today}, Вчера: {yesterday}\n\n" +
-            "Верни JSON строго в таком формате:\n" +
-            "{\n" +
-            "  \"amount\": 500,\n" +
-            "  \"type\": \"expense\",\n" +
-            "  \"categoryName\": \"Еда\",\n" +
-            "  \"accountName\": null,\n" +
-            "  \"comment\": \"кофе\",\n" +
-            "  \"date\": null\n" +
-            "}\n\n" +
-            "Правила:\n" +
-            "- type: \"expense\" если потратил/купил/заплатил, \"income\" если получил/зарплата/заработал\n" +
-            "- amount: только число (пятьсот=500, тысяча=1000, пять тысяч=5000)\n" +
-            "- categoryName: угадай (кофе/ресторан→\"Еда\", такси/автобус→\"Транспорт\", аптека→\"Здоровье\", зарплата→\"Зарплата\")\n" +
-            "- accountName: только если явно сказано (наличкой→\"Наличка\", со сбера→\"Сбер\", с каспия→\"Каспий\"), иначе null\n" +
-            "- comment: краткое описание что купил\n" +
-            $"- date: если \"вчера\"→\"{yesterday}\", \"сегодня\"→\"{today}\", иначе null\n" +
-            "- Если что-то неизвестно — ставь null";
+        // Формируем строки для промпта
+        var catList = string.Join(", ",
+            userCategories.Select(c => $"{c.Emoji}{c.Name}({(c.Type == CategoryType.Income ? "доход" : "расход")})"));
+        var accList = string.Join(", ",
+            userAccounts.Select(a => $"{a.Emoji}{a.Name}"));
 
-        return await CallLlamaAsync(userPrompt);
+        var hasCats = !string.IsNullOrEmpty(catList);
+        var hasAccs = !string.IsNullOrEmpty(accList);
+
+        var prompt =
+            $"Разбери сообщение о финансовой транзакции: \"{message}\"\n\n" +
+            $"Сегодня: {today}, Вчера: {yesterday}\n\n" +
+            (hasCats ? $"КАТЕГОРИИ ПОЛЬЗОВАТЕЛЯ (используй только их!): {catList}\n\n" : "") +
+            (hasAccs ? $"СЧЕТА ПОЛЬЗОВАТЕЛЯ: {accList}\n\n" : "") +
+            "Верни ТОЛЬКО JSON (без markdown):\n" +
+            "{\n" +
+            "  \"amount\": число или null,\n" +
+            "  \"type\": \"expense\" или \"income\" или null,\n" +
+            "  \"categoryName\": \"точное название из списка или null\",\n" +
+            "  \"accountName\": \"точное название из списка или null\",\n" +
+            "  \"comment\": \"краткое описание или null\",\n" +
+            "  \"date\": \"YYYY-MM-DD или null\"\n" +
+            "}\n\n" +
+            "ПРАВИЛА (строго):\n" +
+            "- amount: только число. Слова: пятьсот=500, тысяча=1000, пять тысяч=5000, млн=1000000\n" +
+            "- type: expense если \"потратил/купил/заплатил/плачу\", income если \"получил/заработал/зарплата/пришло\"\n" +
+            (hasCats
+                ? "- categoryName: найди наиболее подходящую категорию из списка выше. Если подходит — ОБЯЗАТЕЛЬНО укажи. null только если совсем не подходит ни одна.\n"
+                : "- categoryName: угадай (кофе→Еда, такси→Транспорт, зарплата→Доход)\n") +
+            (hasAccs
+                ? "- accountName: если упомянут счёт (наличка/каспий/банк) — укажи из списка. Иначе null.\n"
+                : "- accountName: null\n") +
+            $"- date: \"вчера\"={yesterday}, \"сегодня\"={today}, иначе null\n" +
+            "- comment: что именно купил/за что. НЕ дублируй categoryName.\n" +
+            "- Будь уверен! Не оставляй null если можно определить.";
+
+        return await CallLlamaAsync(prompt);
     }
 
     /// <summary>
-    /// Голосовое сообщение → транскрипция (Whisper) → парсинг (Llama)
+    /// Голос → Whisper транскрипция → ParseTextMessageAsync
     /// </summary>
-    public async Task<ParsedTransaction?> ParseVoiceMessageAsync(byte[] audioBytes)
+    public async Task<(ParsedTransaction? parsed, string? transcription)> ParseVoiceMessageAsync(
+        byte[] audioBytes,
+        IEnumerable<Category> userCategories,
+        IEnumerable<Account> userAccounts)
     {
-        // Шаг 1: транскрибируем голос через Groq Whisper
-        var transcribedText = await TranscribeAudioAsync(audioBytes);
-        if (string.IsNullOrWhiteSpace(transcribedText))
-        {
-            _logger.LogWarning("Whisper не смог транскрибировать аудио");
-            return null;
-        }
+        var text = await TranscribeAudioAsync(audioBytes);
+        if (string.IsNullOrWhiteSpace(text))
+            return (null, null);
 
-        _logger.LogInformation("Голос распознан: {Text}", transcribedText);
-
-        // Шаг 2: парсим распознанный текст как обычное сообщение
-        return await ParseTextMessageAsync(transcribedText);
+        var parsed = await ParseTextMessageAsync(text, userCategories, userAccounts);
+        return (parsed, text);
     }
 
     // --- Приватные методы ---
@@ -96,41 +104,35 @@ public class AIService
         {
             var body = new
             {
-                model = Model,
-                messages = new[]
+                model       = Model,
+                messages    = new[]
                 {
-                    new { role = "system", content = SystemPrompt },
+                    new { role = "system", content = "Ты парсер финансов. Отвечай ТОЛЬКО валидным JSON. Никаких пояснений." },
                     new { role = "user",   content = userPrompt }
                 },
-                max_tokens = 300,
-                temperature = 0.1  // Низкая температура = точнее следует инструкции
+                max_tokens  = 300,
+                temperature = 0.1
             };
 
-            var content = new StringContent(
-                JsonSerializer.Serialize(body),
-                Encoding.UTF8,
-                "application/json");
-
+            var content  = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
             var response = await _http.PostAsync(ChatUrl, content);
-            var rawJson = await response.Content.ReadAsStringAsync();
+            var rawJson  = await response.Content.ReadAsStringAsync();
 
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("Groq API ошибка {Code}: {Body}", response.StatusCode, rawJson);
+                _logger.LogError("Groq error {Code}: {Body}", response.StatusCode, rawJson);
                 return null;
             }
 
-            // Извлекаем текст из ответа Groq
-            var doc = JsonNode.Parse(rawJson);
-            var text = doc?["choices"]?[0]?["message"]?["content"]?.ToString() ?? string.Empty;
+            var doc  = JsonNode.Parse(rawJson);
+            var text = doc?["choices"]?[0]?["message"]?["content"]?.ToString() ?? "";
+            _logger.LogDebug("Groq: {Text}", text);
 
-            _logger.LogDebug("Groq ответил: {Text}", text);
-
-            return DeserializeTransaction(CleanJson(text));
+            return Deserialize(CleanJson(text));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Ошибка при обращении к Groq API");
+            _logger.LogError(ex, "Ошибка Groq API");
             return null;
         }
     }
@@ -139,51 +141,40 @@ public class AIService
     {
         try
         {
-            // Groq Whisper принимает multipart/form-data
-            using var formData = new MultipartFormDataContent();
+            using var form = new MultipartFormDataContent();
+            var audio = new ByteArrayContent(audioBytes);
+            audio.Headers.ContentType = new MediaTypeHeaderValue("audio/ogg");
+            form.Add(audio, "file", "voice.ogg");
+            form.Add(new StringContent("whisper-large-v3"), "model");
+            form.Add(new StringContent("ru"), "language");
 
-            var audioContent = new ByteArrayContent(audioBytes);
-            audioContent.Headers.ContentType = new MediaTypeHeaderValue("audio/ogg");
-            formData.Add(audioContent, "file", "voice.ogg");
-            formData.Add(new StringContent("whisper-large-v3"), "model");
-            formData.Add(new StringContent("ru"), "language");  // Подсказываем язык
+            var response = await _http.PostAsync(WhisperUrl, form);
+            var raw      = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode) return null;
 
-            var response = await _http.PostAsync(WhisperUrl, formData);
-            var rawJson = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                _logger.LogError("Whisper ошибка {Code}: {Body}", response.StatusCode, rawJson);
-                return null;
-            }
-
-            var doc = JsonNode.Parse(rawJson);
-            return doc?["text"]?.ToString();
+            return JsonNode.Parse(raw)?["text"]?.ToString();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Ошибка при транскрипции аудио");
+            _logger.LogError(ex, "Ошибка Whisper");
             return null;
         }
     }
 
     private static string CleanJson(string text)
     {
-        // Убираем markdown если модель добавила ```json ... ```
         text = text.Replace("```json", "").Replace("```", "").Trim();
-        var start = text.IndexOf('{');
-        var end = text.LastIndexOf('}');
-        if (start >= 0 && end > start)
-            return text[start..(end + 1)];
-        return text;
+        var s = text.IndexOf('{');
+        var e = text.LastIndexOf('}');
+        return s >= 0 && e > s ? text[s..(e + 1)] : text;
     }
 
-    private ParsedTransaction? DeserializeTransaction(string json)
+    private ParsedTransaction? Deserialize(string json)
     {
         try
         {
-            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-            return JsonSerializer.Deserialize<ParsedTransaction>(json, options);
+            return JsonSerializer.Deserialize<ParsedTransaction>(json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         }
         catch (Exception ex)
         {
