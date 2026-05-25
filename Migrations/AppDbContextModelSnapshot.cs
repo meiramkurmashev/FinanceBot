@@ -40,7 +40,12 @@ namespace FinanceBot.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<long>("UserTelegramId")
+                        .HasColumnType("INTEGER");
+
                     b.HasKey("Id");
+
+                    b.HasIndex("UserTelegramId");
 
                     b.ToTable("Accounts");
                 });
@@ -65,7 +70,12 @@ namespace FinanceBot.Migrations
                     b.Property<int>("Type")
                         .HasColumnType("INTEGER");
 
+                    b.Property<long>("UserTelegramId")
+                        .HasColumnType("INTEGER");
+
                     b.HasKey("Id");
+
+                    b.HasIndex("UserTelegramId");
 
                     b.ToTable("Categories");
                 });
@@ -97,13 +107,61 @@ namespace FinanceBot.Migrations
                     b.Property<int>("Type")
                         .HasColumnType("INTEGER");
 
+                    b.Property<long>("UserTelegramId")
+                        .HasColumnType("INTEGER");
+
                     b.HasKey("Id");
 
                     b.HasIndex("AccountId");
 
                     b.HasIndex("CategoryId");
 
+                    b.HasIndex("UserTelegramId");
+
                     b.ToTable("Transactions");
+                });
+
+            modelBuilder.Entity("FinanceBot.Models.User", b =>
+                {
+                    b.Property<long>("TelegramId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("FullName")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("RegisteredAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Username")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("TelegramId");
+
+                    b.ToTable("Users");
+                });
+
+            modelBuilder.Entity("FinanceBot.Models.Account", b =>
+                {
+                    b.HasOne("FinanceBot.Models.User", "User")
+                        .WithMany("Accounts")
+                        .HasForeignKey("UserTelegramId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("User");
+                });
+
+            modelBuilder.Entity("FinanceBot.Models.Category", b =>
+                {
+                    b.HasOne("FinanceBot.Models.User", "User")
+                        .WithMany("Categories")
+                        .HasForeignKey("UserTelegramId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("User");
                 });
 
             modelBuilder.Entity("FinanceBot.Models.Transaction", b =>
@@ -120,9 +178,17 @@ namespace FinanceBot.Migrations
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
 
+                    b.HasOne("FinanceBot.Models.User", "User")
+                        .WithMany("Transactions")
+                        .HasForeignKey("UserTelegramId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
                     b.Navigation("Account");
 
                     b.Navigation("Category");
+
+                    b.Navigation("User");
                 });
 
             modelBuilder.Entity("FinanceBot.Models.Account", b =>
@@ -132,6 +198,15 @@ namespace FinanceBot.Migrations
 
             modelBuilder.Entity("FinanceBot.Models.Category", b =>
                 {
+                    b.Navigation("Transactions");
+                });
+
+            modelBuilder.Entity("FinanceBot.Models.User", b =>
+                {
+                    b.Navigation("Accounts");
+
+                    b.Navigation("Categories");
+
                     b.Navigation("Transactions");
                 });
 #pragma warning restore 612, 618

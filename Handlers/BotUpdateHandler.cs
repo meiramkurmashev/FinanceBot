@@ -9,24 +9,24 @@ using Telegram.Bot.Types.ReplyMarkups;
 
 namespace FinanceBot.Handlers;
 
-/// <summary>
-/// Главный обработчик всех входящих сообщений от Telegram
-/// </summary>
 public class BotUpdateHandler : IUpdateHandler
 {
     private readonly AIService _ai;
     private readonly FinanceService _finance;
+    private readonly UserService _userService;
     private readonly ConversationService _conversation;
     private readonly ILogger<BotUpdateHandler> _logger;
 
     public BotUpdateHandler(
         AIService ai,
         FinanceService finance,
+        UserService userService,
         ConversationService conversation,
         ILogger<BotUpdateHandler> logger)
     {
         _ai = ai;
         _finance = finance;
+        _userService = userService;
         _conversation = conversation;
         _logger = logger;
     }
@@ -37,13 +37,10 @@ public class BotUpdateHandler : IUpdateHandler
     {
         try
         {
-            var handler = update.Type switch
-            {
-                UpdateType.Message      => HandleMessageAsync(bot, update.Message!, ct),
-                UpdateType.CallbackQuery => HandleCallbackAsync(bot, update.CallbackQuery!, ct),
-                _                       => Task.CompletedTask
-            };
-            await handler;
+            if (update.Type == UpdateType.Message)
+                await HandleMessageAsync(bot, update.Message!, ct);
+            else if (update.Type == UpdateType.CallbackQuery)
+                await HandleCallbackAsync(bot, update.CallbackQuery!, ct);
         }
         catch (Exception ex)
         {
@@ -53,214 +50,215 @@ public class BotUpdateHandler : IUpdateHandler
 
     public Task HandleErrorAsync(ITelegramBotClient bot, Exception exception, HandleErrorSource source, CancellationToken ct)
     {
-        var errorMessage = exception switch
-        {
-            ApiRequestException apiEx => $"Telegram API Error: {apiEx.ErrorCode} - {apiEx.Message}",
-            _ => exception.ToString()
-        };
-        _logger.LogError(errorMessage);
+        if (exception is ApiRequestException api)
+            _logger.LogError("Telegram API Error {Code}: {Msg}", api.ErrorCode, api.Message);
+        else
+            _logger.LogError(exception, "Ошибка бота");
         return Task.CompletedTask;
     }
 
-    // ===== ОБРАБОТКА СООБЩЕНИЙ =====
+    // ===== СООБЩЕНИЯ =====
 
     private async Task HandleMessageAsync(ITelegramBotClient bot, Message message, CancellationToken ct)
     {
         var chatId = message.Chat.Id;
+        var fromUser = message.From;
+
+        // Авторегистрация при любом сообщении
+        var fullName = $"{fromUser?.FirstName} {fromUser?.LastName}".Trim();
+        var (user, isNew) = await _userService.GetOrCreateAsync(chatId, fullName, fromUser?.Username);
 
         // Команды
         if (message.Text?.StartsWith('/') == true)
         {
-            await HandleCommandAsync(bot, message, ct);
+            await HandleCommandAsync(bot, message, user.TelegramId, ct);
             return;
         }
 
-        // Если бот ждёт ответа от пользователя (многошаговый диалог)
+        // Многошаговый диалог (бот ждёт ответа)
         var state = _conversation.Get(chatId);
         if (state.Step != ConversationStep.None)
         {
-            await HandleConversationReplyAsync(bot, message, state, ct);
+            await HandleConversationReplyAsync(bot, message, state, user.TelegramId, ct);
             return;
         }
 
         // Голосовое сообщение
         if (message.Voice != null)
         {
-            await HandleVoiceMessageAsync(bot, message, ct);
+            await HandleVoiceMessageAsync(bot, message, user.TelegramId, ct);
             return;
         }
 
-        // Обычный текст → пытаемся распарсить как транзакцию
+        // Обычный текст → парсим как транзакцию
         if (!string.IsNullOrWhiteSpace(message.Text))
         {
-            await HandleTransactionTextAsync(bot, message, message.Text, ct);
+            await HandleTransactionTextAsync(bot, message, message.Text, user.TelegramId, ct);
             return;
         }
 
-        await bot.SendMessage(chatId, "Напиши что-нибудь, например: \"потратил 500 на кофе\" 😊", cancellationToken: ct);
+        await bot.SendMessage(chatId, "Напиши что потратил или получил 😊", cancellationToken: ct);
     }
 
     // ===== КОМАНДЫ =====
 
-    private async Task HandleCommandAsync(ITelegramBotClient bot, Message message, CancellationToken ct)
+    private async Task HandleCommandAsync(ITelegramBotClient bot, Message message, long userId, CancellationToken ct)
     {
         var chatId = message.Chat.Id;
-        var command = message.Text!.Split(' ')[0].ToLower().Replace($"@{(await bot.GetMe(ct)).Username}", "");
+        var cmd = message.Text!.Split(' ')[0].ToLower().Split('@')[0];
 
-        switch (command)
+        switch (cmd)
         {
-            case "/start":
-                await SendWelcomeAsync(bot, chatId, ct);
-                break;
-
-            case "/balance":
-                await SendBalanceAsync(bot, chatId, ct);
-                break;
-
-            case "/stats":
-                await SendStatsAsync(bot, chatId, DateTime.Today.Year, DateTime.Today.Month, ct);
-                break;
-
-            case "/categories":
-                await SendCategoriesAsync(bot, chatId, ct);
-                break;
-
-            case "/accounts":
-                await SendAccountsAsync(bot, chatId, ct);
-                break;
-
-            case "/help":
-                await SendHelpAsync(bot, chatId, ct);
-                break;
-
-            default:
-                await bot.SendMessage(chatId, "Неизвестная команда. Напиши /help", cancellationToken: ct);
-                break;
+            case "/start":   await SendWelcomeAsync(bot, chatId, userId, ct); break;
+            case "/balance": await SendBalanceAsync(bot, chatId, userId, ct); break;
+            case "/stats":   await SendStatsAsync(bot, chatId, userId, DateTime.Today.Year, DateTime.Today.Month, ct); break;
+            case "/categories": await SendCategoriesAsync(bot, chatId, userId, ct); break;
+            case "/accounts":   await SendAccountsAsync(bot, chatId, userId, ct); break;
+            case "/help":    await SendHelpAsync(bot, chatId, ct); break;
+            default:         await bot.SendMessage(chatId, "Неизвестная команда. /help", cancellationToken: ct); break;
         }
     }
 
-    private async Task SendWelcomeAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
+    private async Task SendWelcomeAsync(ITelegramBotClient bot, long chatId, long userId, CancellationToken ct)
     {
-        var text = """
-            👋 Привет! Я твой личный финансовый помощник.
-
-            Просто напиши или скажи что потратил или получил:
-            • "потратил 500 на кофе"
-            • "получил зарплату 80000"
-            • "заплатил 2000 за такси вчера"
-
-            📌 Команды:
-            /balance — текущий баланс по счетам
-            /stats — статистика за текущий месяц
-            /categories — управление категориями
-            /accounts — управление счетами
-            /help — помощь
-            """;
+        var isNew = !await _userService.IsRegisteredAsync(userId);
+        var text = isNew
+            ? "👋 Добро пожаловать! Я твой личный финансовый помощник.\n\n" +
+              "Для тебя уже созданы счета: 💵 Наличка, 💳 Каспий, 🏦 Другой банк\n\n" +
+              "Добавь свои категории через /categories и начни вести учёт!\n\n" +
+              "Просто напиши или скажи что потратил:\n" +
+              "• \"потратил 5000 на продукты\"\n• \"получил зарплату 200000\""
+            : "👋 Привет! Чем могу помочь?\n\n" +
+              "/balance — баланс\n/stats — статистика\n/categories — категории\n/accounts — счета";
 
         await bot.SendMessage(chatId, text, cancellationToken: ct);
     }
 
     private async Task SendHelpAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
     {
-        var text = """
-            💡 *Как пользоваться:*
-
-            Просто пиши естественным языком:
-            ✅ "потратил 1500 в магазине"
-            ✅ "заплатил пятьсот за обед наличкой"
-            ✅ "вчера получил зарплату 90000 на сбер"
-            ✅ Или отправь голосовое сообщение 🎤
-
-            Если я не пойму что-то — спрошу уточнение.
-
-            *Команды:*
-            /balance — баланс счетов
-            /stats — статистика за месяц
-            /categories — категории расходов/доходов
-            /accounts — твои счета
-            """;
+        var text =
+            "💡 *Как пользоваться:*\n\n" +
+            "Просто пиши естественным языком:\n" +
+            "✅ \"потратил 1500 в магазине\"\n" +
+            "✅ \"заплатил пять тысяч за такси наличкой\"\n" +
+            "✅ \"вчера получил зарплату 300000 на каспий\"\n" +
+            "✅ Или отправь голосовое 🎤\n\n" +
+            "*Команды:*\n" +
+            "/balance — баланс счетов\n" +
+            "/stats — статистика за месяц\n" +
+            "/categories — управление категориями\n" +
+            "/accounts — управление счетами";
 
         await bot.SendMessage(chatId, text, parseMode: ParseMode.Markdown, cancellationToken: ct);
     }
 
-    private async Task SendBalanceAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
+    private async Task SendBalanceAsync(ITelegramBotClient bot, long chatId, long userId, CancellationToken ct)
     {
-        var summary = await _finance.GetBalanceSummaryAsync();
-        await bot.SendMessage(chatId, $"💰 *Текущий баланс*\n\n{summary}", parseMode: ParseMode.Markdown, cancellationToken: ct);
+        var summary = await _finance.GetBalanceSummaryAsync(userId);
+        await bot.SendMessage(chatId, $"💰 *Текущий баланс*\n\n{summary}",
+            parseMode: ParseMode.Markdown, cancellationToken: ct);
     }
 
-    private async Task SendStatsAsync(ITelegramBotClient bot, long chatId, int year, int month, CancellationToken ct)
+    private async Task SendStatsAsync(ITelegramBotClient bot, long chatId, long userId, int year, int month, CancellationToken ct)
     {
-        var monthName = new DateTime(year, month, 1).ToString("MMMM yyyy", new System.Globalization.CultureInfo("ru-RU"));
-        var stats = await _finance.GetMonthlyStatsAsync(year, month);
-        await bot.SendMessage(chatId, $"📊 *Статистика за {monthName}*\n\n{stats}", parseMode: ParseMode.Markdown, cancellationToken: ct);
+        var monthName = new DateTime(year, month, 1).ToString("MMMM yyyy",
+            new System.Globalization.CultureInfo("ru-RU"));
+        var stats = await _finance.GetMonthlyStatsAsync(userId, year, month);
+        await bot.SendMessage(chatId, $"📊 *Статистика за {monthName}*\n\n{stats}",
+            parseMode: ParseMode.Markdown, cancellationToken: ct);
     }
 
-    private async Task SendCategoriesAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
+    // ===== КАТЕГОРИИ (CRUD) =====
+
+    private async Task SendCategoriesAsync(ITelegramBotClient bot, long chatId, long userId, CancellationToken ct)
     {
-        var categories = await _finance.GetCategoriesAsync();
-        var expenses = categories.Where(c => c.Type == CategoryType.Expense || c.Type == CategoryType.Both).ToList();
-        var incomes = categories.Where(c => c.Type == CategoryType.Income || c.Type == CategoryType.Both).ToList();
+        var categories = await _finance.GetCategoriesAsync(userId);
 
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine("📁 *Категории расходов:*");
-        foreach (var c in expenses) sb.AppendLine($"  {c.Emoji} {c.Name}");
-        sb.AppendLine();
-        sb.AppendLine("📁 *Категории доходов:*");
-        foreach (var c in incomes) sb.AppendLine($"  {c.Emoji} {c.Name}");
-
-        var keyboard = new InlineKeyboardMarkup(new[]
+        if (!categories.Any())
         {
-            new[] { InlineKeyboardButton.WithCallbackData("➕ Добавить категорию", "add_category") }
-        });
+            var emptyKeyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("➕ Добавить категорию", "cat_add") }
+            });
+            await bot.SendMessage(chatId,
+                "📁 У тебя пока нет категорий.\nДобавь первую!",
+                replyMarkup: emptyKeyboard, cancellationToken: ct);
+            return;
+        }
 
-        await bot.SendMessage(chatId, sb.ToString(), parseMode: ParseMode.Markdown, replyMarkup: keyboard, cancellationToken: ct);
+        var expenses = categories.Where(c => c.Type == CategoryType.Expense || c.Type == CategoryType.Both).ToList();
+        var incomes  = categories.Where(c => c.Type == CategoryType.Income  || c.Type == CategoryType.Both).ToList();
+
+        var sb = new System.Text.StringBuilder("📁 *Твои категории:*\n");
+        if (expenses.Any())
+        {
+            sb.AppendLine("\n💸 Расходы:");
+            foreach (var c in expenses) sb.AppendLine($"  {c.Emoji} {c.Name}");
+        }
+        if (incomes.Any())
+        {
+            sb.AppendLine("\n💰 Доходы:");
+            foreach (var c in incomes) sb.AppendLine($"  {c.Emoji} {c.Name}");
+        }
+
+        // Кнопки: [✏️ Изменить] [🗑️ Удалить] для каждой категории + Добавить
+        var rows = new List<InlineKeyboardButton[]>();
+        foreach (var c in categories)
+        {
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData($"{c.Emoji} {c.Name}", $"cat_noop"),
+                InlineKeyboardButton.WithCallbackData("✏️", $"cat_edit_{c.Id}"),
+                InlineKeyboardButton.WithCallbackData("🗑️", $"cat_del_{c.Id}")
+            });
+        }
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("➕ Добавить категорию", "cat_add") });
+
+        await bot.SendMessage(chatId, sb.ToString(),
+            parseMode: ParseMode.Markdown,
+            replyMarkup: new InlineKeyboardMarkup(rows),
+            cancellationToken: ct);
     }
 
-    private async Task SendAccountsAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
-    {
-        var accounts = await _finance.GetAccountsAsync();
+    // ===== СЧЕТА =====
 
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine("🏦 *Твои счета:*\n");
+    private async Task SendAccountsAsync(ITelegramBotClient bot, long chatId, long userId, CancellationToken ct)
+    {
+        var accounts = await _finance.GetAccountsAsync(userId);
+        var sb = new System.Text.StringBuilder("🏦 *Твои счета:*\n\n");
         foreach (var a in accounts)
             sb.AppendLine($"{a.Emoji} *{a.Name}*: {FinanceService.FormatMoney(a.Balance)}");
 
         var keyboard = new InlineKeyboardMarkup(new[]
         {
-            new[] { InlineKeyboardButton.WithCallbackData("➕ Добавить счёт", "add_account") }
+            new[] { InlineKeyboardButton.WithCallbackData("➕ Добавить счёт", "acc_add") }
         });
-
-        await bot.SendMessage(chatId, sb.ToString(), parseMode: ParseMode.Markdown, replyMarkup: keyboard, cancellationToken: ct);
+        await bot.SendMessage(chatId, sb.ToString(),
+            parseMode: ParseMode.Markdown,
+            replyMarkup: keyboard,
+            cancellationToken: ct);
     }
 
-    // ===== ОБРАБОТКА ТРАНЗАКЦИЙ =====
+    // ===== ТРАНЗАКЦИИ =====
 
-    private async Task HandleVoiceMessageAsync(ITelegramBotClient bot, Message message, CancellationToken ct)
+    private async Task HandleVoiceMessageAsync(ITelegramBotClient bot, Message message, long userId, CancellationToken ct)
     {
         var chatId = message.Chat.Id;
         var waitMsg = await bot.SendMessage(chatId, "🎤 Распознаю голосовое...", cancellationToken: ct);
-
         try
         {
-            // Скачиваем голосовое сообщение
             var fileInfo = await bot.GetFile(message.Voice!.FileId, ct);
             using var stream = new MemoryStream();
             await bot.DownloadFile(fileInfo.FilePath!, stream, ct);
-            var audioBytes = stream.ToArray();
 
-            // Удаляем сообщение "распознаю..."
             await bot.DeleteMessage(chatId, waitMsg.MessageId, ct);
-
-            // Парсим через Gemini
-            var parsed = await _ai.ParseVoiceMessageAsync(audioBytes);
+            var parsed = await _ai.ParseVoiceMessageAsync(stream.ToArray());
             if (parsed == null)
             {
-                await bot.SendMessage(chatId, "❌ Не удалось распознать голосовое. Попробуй написать текстом.", cancellationToken: ct);
+                await bot.SendMessage(chatId, "❌ Не удалось распознать. Попробуй написать текстом.", cancellationToken: ct);
                 return;
             }
-
-            await ProcessParsedTransactionAsync(bot, chatId, parsed, ct);
+            await ProcessParsedTransactionAsync(bot, chatId, userId, parsed, ct);
         }
         catch (Exception ex)
         {
@@ -270,31 +268,26 @@ public class BotUpdateHandler : IUpdateHandler
         }
     }
 
-    private async Task HandleTransactionTextAsync(ITelegramBotClient bot, Message message, string text, CancellationToken ct)
+    private async Task HandleTransactionTextAsync(ITelegramBotClient bot, Message message, string text, long userId, CancellationToken ct)
     {
         var chatId = message.Chat.Id;
-
-        // Парсим через Gemini
         var parsed = await _ai.ParseTextMessageAsync(text);
         if (parsed == null)
         {
-            await bot.SendMessage(chatId, "🤔 Не понял. Попробуй написать например: \"потратил 500 на кофе\"", cancellationToken: ct);
+            await bot.SendMessage(chatId,
+                "🤔 Не понял. Попробуй: \"потратил 5000 на продукты\"",
+                cancellationToken: ct);
             return;
         }
-
-        await ProcessParsedTransactionAsync(bot, chatId, parsed, ct);
+        await ProcessParsedTransactionAsync(bot, chatId, userId, parsed, ct);
     }
 
-    /// <summary>
-    /// Обрабатывает распарсенную транзакцию:
-    /// если чего-то не хватает — спрашивает пользователя
-    /// </summary>
-    private async Task ProcessParsedTransactionAsync(ITelegramBotClient bot, long chatId, ParsedTransaction parsed, CancellationToken ct)
+    private async Task ProcessParsedTransactionAsync(
+        ITelegramBotClient bot, long chatId, long userId,
+        ParsedTransaction parsed, CancellationToken ct)
     {
-        // Сохраняем транзакцию в состояние (она может быть неполной)
         var state = new ConversationState { PendingTransaction = parsed };
 
-        // Проверяем сумму
         if (!parsed.Amount.HasValue || parsed.Amount <= 0)
         {
             _conversation.Set(chatId, state with { Step = ConversationStep.WaitingForAmount });
@@ -302,248 +295,351 @@ public class BotUpdateHandler : IUpdateHandler
             return;
         }
 
-        // Проверяем тип (доход/расход)
         if (string.IsNullOrEmpty(parsed.Type))
         {
             _conversation.Set(chatId, state with { Step = ConversationStep.WaitingForType });
-            var keyboard = new InlineKeyboardMarkup(new[]
+            var kb = new InlineKeyboardMarkup(new[]
             {
                 new[]
                 {
                     InlineKeyboardButton.WithCallbackData("💸 Расход", "type_expense"),
-                    InlineKeyboardButton.WithCallbackData("💰 Доход", "type_income")
+                    InlineKeyboardButton.WithCallbackData("💰 Доход",  "type_income")
                 }
             });
-            await bot.SendMessage(chatId, "💬 Это доход или расход?", replyMarkup: keyboard, cancellationToken: ct);
+            await bot.SendMessage(chatId, "💬 Это доход или расход?", replyMarkup: kb, cancellationToken: ct);
             return;
         }
 
-        // Проверяем категорию
         var transType = parsed.Type == "income" ? TransactionType.Income : TransactionType.Expense;
         Category? category = null;
-
         if (!string.IsNullOrEmpty(parsed.CategoryName))
-            category = await _finance.FindCategoryByNameAsync(parsed.CategoryName, CategoryType.Expense);
+            category = await _finance.FindCategoryByNameAsync(userId, parsed.CategoryName);
 
         if (category == null)
         {
+            var categories = await _finance.GetCategoriesAsync(userId);
+            if (!categories.Any())
+            {
+                _conversation.Set(chatId, state with { Step = ConversationStep.WaitingForCategory });
+                await bot.SendMessage(chatId,
+                    "📁 У тебя нет категорий. Сначала добавь через /categories",
+                    cancellationToken: ct);
+                return;
+            }
             _conversation.Set(chatId, state with { Step = ConversationStep.WaitingForCategory });
-            await AskForCategoryAsync(bot, chatId, transType, ct);
+            await AskForCategoryAsync(bot, chatId, userId, transType, ct);
             return;
         }
 
-        // Проверяем счёт
         Account? account = null;
-
         if (!string.IsNullOrEmpty(parsed.AccountName))
-            account = await _finance.FindAccountByNameAsync(parsed.AccountName);
+            account = await _finance.FindAccountByNameAsync(userId, parsed.AccountName);
 
         if (account == null)
         {
-            _conversation.Set(chatId, state with { Step = ConversationStep.WaitingForAccount, PendingTransaction = parsed with { CategoryName = category.Name } });
-            await AskForAccountAsync(bot, chatId, ct);
+            _conversation.Set(chatId, state with
+            {
+                Step = ConversationStep.WaitingForAccount,
+                PendingTransaction = parsed with { CategoryName = category.Name }
+            });
+            await AskForAccountAsync(bot, chatId, userId, ct);
             return;
         }
 
-        // Всё есть — сохраняем!
-        await SaveTransactionAsync(bot, chatId, parsed, category, account, ct);
+        await SaveTransactionAsync(bot, chatId, userId, parsed, category, account, ct);
     }
 
-    private async Task AskForCategoryAsync(ITelegramBotClient bot, long chatId, TransactionType type, CancellationToken ct)
+    private async Task AskForCategoryAsync(ITelegramBotClient bot, long chatId, long userId, TransactionType type, CancellationToken ct)
     {
-        var categoryType = type == TransactionType.Expense ? CategoryType.Expense : CategoryType.Income;
-        var categories = await _finance.GetCategoriesAsync(categoryType);
+        var catType = type == TransactionType.Expense ? CategoryType.Expense : CategoryType.Income;
+        var categories = await _finance.GetCategoriesAsync(userId, catType);
 
-        // Создаём кнопки по 2 в ряд
+        if (!categories.Any())
+            categories = await _finance.GetCategoriesAsync(userId); // Все если нет нужного типа
+
         var buttons = categories
             .Select(c => InlineKeyboardButton.WithCallbackData($"{c.Emoji} {c.Name}", $"cat_{c.Id}"))
-            .Chunk(2)
-            .Select(row => row.ToArray())
-            .ToArray();
+            .Chunk(2).Select(r => r.ToArray()).ToArray();
 
-        var keyboard = new InlineKeyboardMarkup(buttons);
-        await bot.SendMessage(chatId, "📁 В какую категорию внести?", replyMarkup: keyboard, cancellationToken: ct);
+        await bot.SendMessage(chatId, "📁 В какую категорию?",
+            replyMarkup: new InlineKeyboardMarkup(buttons), cancellationToken: ct);
     }
 
-    private async Task AskForAccountAsync(ITelegramBotClient bot, long chatId, CancellationToken ct)
+    private async Task AskForAccountAsync(ITelegramBotClient bot, long chatId, long userId, CancellationToken ct)
     {
-        var accounts = await _finance.GetAccountsAsync();
-
+        var accounts = await _finance.GetAccountsAsync(userId);
         var buttons = accounts
             .Select(a => InlineKeyboardButton.WithCallbackData($"{a.Emoji} {a.Name}", $"acc_{a.Id}"))
-            .Chunk(2)
-            .Select(row => row.ToArray())
-            .ToArray();
+            .Chunk(2).Select(r => r.ToArray()).ToArray();
 
-        var keyboard = new InlineKeyboardMarkup(buttons);
-        await bot.SendMessage(chatId, "🏦 В какой счёт?", replyMarkup: keyboard, cancellationToken: ct);
+        await bot.SendMessage(chatId, "🏦 В какой счёт?",
+            replyMarkup: new InlineKeyboardMarkup(buttons), cancellationToken: ct);
     }
 
     private async Task SaveTransactionAsync(
-        ITelegramBotClient bot,
-        long chatId,
-        ParsedTransaction parsed,
-        Category category,
-        Account account,
-        CancellationToken ct)
+        ITelegramBotClient bot, long chatId, long userId,
+        ParsedTransaction parsed, Category category, Account account, CancellationToken ct)
     {
         var transType = parsed.Type == "income" ? TransactionType.Income : TransactionType.Expense;
         DateTime? date = null;
         if (!string.IsNullOrEmpty(parsed.Date) && DateTime.TryParse(parsed.Date, out var d))
             date = d;
 
-        var transaction = await _finance.AddTransactionAsync(
-            amount: parsed.Amount!.Value,
-            type: transType,
-            categoryId: category.Id,
-            accountId: account.Id,
-            comment: parsed.Comment,
-            date: date
-        );
+        await _finance.AddTransactionAsync(userId, parsed.Amount!.Value, transType,
+            category.Id, account.Id, parsed.Comment, date);
 
         _conversation.Reset(chatId);
 
-        // Формируем красивое подтверждение
-        var typeSign = transType == TransactionType.Expense ? "-" : "+";
+        var sign    = transType == TransactionType.Expense ? "-" : "+";
         var typeEmoji = transType == TransactionType.Expense ? "💸" : "💰";
-        var commentText = string.IsNullOrEmpty(parsed.Comment) ? "" : $" · _{parsed.Comment}_";
-        var dateText = transaction.Date.Date == DateTime.Today ? "" : $" · {transaction.Date:dd.MM.yyyy}";
+        var comment = string.IsNullOrEmpty(parsed.Comment) ? "" : $" · _{parsed.Comment}_";
 
-        var confirmText = $"✅ Внесено!\n\n{typeEmoji} {typeSign}{FinanceService.FormatMoney(parsed.Amount!.Value)}{commentText}\n" +
-                          $"📁 {category.Emoji} {category.Name} · {account.Emoji} {account.Name}{dateText}";
-
-        await bot.SendMessage(chatId, confirmText, parseMode: ParseMode.Markdown, cancellationToken: ct);
+        await bot.SendMessage(chatId,
+            $"✅ Внесено!\n\n{typeEmoji} {sign}{FinanceService.FormatMoney(parsed.Amount!.Value)}{comment}\n" +
+            $"📁 {category.Emoji} {category.Name} · {account.Emoji} {account.Name}",
+            parseMode: ParseMode.Markdown, cancellationToken: ct);
     }
 
     // ===== МНОГОШАГОВЫЙ ДИАЛОГ =====
 
     private async Task HandleConversationReplyAsync(
-        ITelegramBotClient bot,
-        Message message,
-        ConversationState state,
-        CancellationToken ct)
+        ITelegramBotClient bot, Message message,
+        ConversationState state, long userId, CancellationToken ct)
     {
         var chatId = message.Chat.Id;
-        var text = message.Text ?? string.Empty;
-        var pending = state.PendingTransaction!;
+        var text = message.Text?.Trim() ?? string.Empty;
 
         switch (state.Step)
         {
+            // --- Транзакции ---
             case ConversationStep.WaitingForAmount:
-                if (decimal.TryParse(text.Replace(",", "."), System.Globalization.NumberStyles.Any,
+                if (decimal.TryParse(text.Replace(",", "."),
+                    System.Globalization.NumberStyles.Any,
                     System.Globalization.CultureInfo.InvariantCulture, out var amount))
                 {
-                    pending.Amount = amount;
-                    _conversation.Set(chatId, state with { Step = ConversationStep.None });
-                    await ProcessParsedTransactionAsync(bot, chatId, pending, ct);
+                    var updated = state with { Step = ConversationStep.None };
+                    updated.PendingTransaction!.Amount = amount;
+                    _conversation.Set(chatId, updated);
+                    await ProcessParsedTransactionAsync(bot, chatId, userId, updated.PendingTransaction!, ct);
                 }
                 else
-                {
-                    await bot.SendMessage(chatId, "Введи число, например: 500", cancellationToken: ct);
-                }
+                    await bot.SendMessage(chatId, "Введи число, например: 5000", cancellationToken: ct);
                 break;
 
             case ConversationStep.WaitingForAccountName:
-                var newAccount = await _finance.CreateAccountAsync(text);
-                await bot.SendMessage(chatId, $"✅ Счёт *{newAccount.Emoji} {newAccount.Name}* создан!", parseMode: ParseMode.Markdown, cancellationToken: ct);
+                var newAcc = await _finance.CreateAccountAsync(userId, text);
                 _conversation.Reset(chatId);
+                await bot.SendMessage(chatId,
+                    $"✅ Счёт *{newAcc.Emoji} {newAcc.Name}* добавлен!",
+                    parseMode: ParseMode.Markdown, cancellationToken: ct);
                 break;
 
-            case ConversationStep.WaitingForCategoryName:
-                // Будет реализовано позже
-                _conversation.Reset(chatId);
+            // --- Категории ---
+            case ConversationStep.WaitingForNewCategoryName:
+                _conversation.Set(chatId, state with
+                {
+                    Step = ConversationStep.WaitingForNewCategoryEmoji,
+                    NewCategoryName = text
+                });
+                await bot.SendMessage(chatId,
+                    "Введи эмодзи для категории (например: 🍔 или 🚗):",
+                    cancellationToken: ct);
+                break;
+
+            case ConversationStep.WaitingForNewCategoryEmoji:
+                _conversation.Set(chatId, state with
+                {
+                    Step = ConversationStep.WaitingForNewCategoryType,
+                    NewCategoryEmoji = text
+                });
+                var typeKb = new InlineKeyboardMarkup(new[]
+                {
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("💸 Расход", "newcat_type_expense"),
+                        InlineKeyboardButton.WithCallbackData("💰 Доход",  "newcat_type_income"),
+                        InlineKeyboardButton.WithCallbackData("🔄 Оба",    "newcat_type_both")
+                    }
+                });
+                await bot.SendMessage(chatId, "Тип категории?",
+                    replyMarkup: typeKb, cancellationToken: ct);
+                break;
+
+            case ConversationStep.WaitingForEditCategoryName:
+                if (state.EditCategoryId.HasValue)
+                {
+                    await _finance.RenameCategoryAsync(userId, state.EditCategoryId.Value, text);
+                    _conversation.Reset(chatId);
+                    await bot.SendMessage(chatId, $"✅ Категория переименована в *{text}*",
+                        parseMode: ParseMode.Markdown, cancellationToken: ct);
+                    await SendCategoriesAsync(bot, chatId, userId, ct);
+                }
                 break;
         }
     }
 
-    // ===== CALLBACK QUERIES (нажатие на инлайн-кнопки) =====
+    // ===== CALLBACK QUERIES =====
 
     private async Task HandleCallbackAsync(ITelegramBotClient bot, CallbackQuery callback, CancellationToken ct)
     {
         var chatId = callback.Message!.Chat.Id;
         var data = callback.Data ?? string.Empty;
-
         await bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
 
+        var (user, _) = await _userService.GetOrCreateAsync(chatId, "", null);
+        var userId = user.TelegramId;
         var state = _conversation.Get(chatId);
 
-        // Выбор категории
-        if (data.StartsWith("cat_") && int.TryParse(data[4..], out var catId))
+        // --- Выбор категории при добавлении транзакции ---
+        if (data.StartsWith("cat_") && int.TryParse(data[4..], out var catId) && data.Length > 4 && char.IsDigit(data[4]))
         {
-            var categories = await _finance.GetCategoriesAsync();
-            var category = categories.FirstOrDefault(c => c.Id == catId);
+            var category = (await _finance.GetCategoriesAsync(userId))
+                .FirstOrDefault(c => c.Id == catId);
             if (category == null) return;
 
             await bot.DeleteMessage(chatId, callback.Message.MessageId, ct);
-
             var pending = state.PendingTransaction!;
             pending.CategoryName = category.Name;
 
-            // Теперь проверяем счёт
             Account? account = null;
             if (!string.IsNullOrEmpty(pending.AccountName))
-                account = await _finance.FindAccountByNameAsync(pending.AccountName);
+                account = await _finance.FindAccountByNameAsync(userId, pending.AccountName);
 
             if (account == null)
             {
                 _conversation.Set(chatId, state with { Step = ConversationStep.WaitingForAccount });
-                await AskForAccountAsync(bot, chatId, ct);
+                await AskForAccountAsync(bot, chatId, userId, ct);
             }
             else
             {
-                await SaveTransactionAsync(bot, chatId, pending, category, account, ct);
+                await SaveTransactionAsync(bot, chatId, userId, pending, category, account, ct);
             }
             return;
         }
 
-        // Выбор счёта
-        if (data.StartsWith("acc_") && int.TryParse(data[4..], out var accId))
+        // --- Выбор счёта при добавлении транзакции ---
+        if (data.StartsWith("acc_") && int.TryParse(data[4..], out var accId) && data.Length > 4 && char.IsDigit(data[4]))
         {
-            var accounts = await _finance.GetAccountsAsync();
-            var account = accounts.FirstOrDefault(a => a.Id == accId);
+            var account = (await _finance.GetAccountsAsync(userId))
+                .FirstOrDefault(a => a.Id == accId);
             if (account == null) return;
 
             await bot.DeleteMessage(chatId, callback.Message.MessageId, ct);
-
             var pending = state.PendingTransaction!;
-            var category = await _finance.FindCategoryByNameAsync(pending.CategoryName ?? "Другое");
+            var category = await _finance.FindCategoryByNameAsync(userId, pending.CategoryName ?? "");
             if (category == null)
             {
-                var allCats = await _finance.GetCategoriesAsync();
-                category = allCats.First(); // fallback
+                var all = await _finance.GetCategoriesAsync(userId);
+                category = all.FirstOrDefault();
+                if (category == null)
+                {
+                    await bot.SendMessage(chatId, "Сначала добавь категории через /categories", cancellationToken: ct);
+                    _conversation.Reset(chatId);
+                    return;
+                }
             }
-
-            await SaveTransactionAsync(bot, chatId, pending, category, account, ct);
+            await SaveTransactionAsync(bot, chatId, userId, pending, category, account, ct);
             return;
         }
 
-        // Выбор типа (доход/расход)
-        if (data == "type_expense" || data == "type_income")
+        // --- Тип транзакции (доход/расход) ---
+        if (data is "type_expense" or "type_income")
         {
             await bot.DeleteMessage(chatId, callback.Message.MessageId, ct);
             var pending = state.PendingTransaction!;
             pending.Type = data == "type_expense" ? "expense" : "income";
             _conversation.Set(chatId, state with { Step = ConversationStep.None });
-            await ProcessParsedTransactionAsync(bot, chatId, pending, ct);
+            await ProcessParsedTransactionAsync(bot, chatId, userId, pending, ct);
             return;
         }
 
-        // Добавить счёт
-        if (data == "add_account")
+        // --- Категории CRUD ---
+        if (data == "cat_add")
         {
+            _conversation.Set(chatId, new ConversationState { Step = ConversationStep.WaitingForNewCategoryName });
+            await bot.SendMessage(chatId, "✏️ Введи название новой категории:", cancellationToken: ct);
+            return;
+        }
+
+        if (data.StartsWith("cat_edit_") && int.TryParse(data[9..], out var editId))
+        {
+            var cat = (await _finance.GetCategoriesAsync(userId)).FirstOrDefault(c => c.Id == editId);
+            if (cat == null) return;
             _conversation.Set(chatId, new ConversationState
             {
-                Step = ConversationStep.WaitingForAccountName,
-                PendingTransaction = new ParsedTransaction()
+                Step = ConversationStep.WaitingForEditCategoryName,
+                EditCategoryId = editId
             });
+            await bot.SendMessage(chatId,
+                $"✏️ Введи новое название для *{cat.Emoji} {cat.Name}*:",
+                parseMode: ParseMode.Markdown, cancellationToken: ct);
+            return;
+        }
+
+        if (data.StartsWith("cat_del_") && int.TryParse(data[8..], out var delId))
+        {
+            var cat = (await _finance.GetCategoriesAsync(userId)).FirstOrDefault(c => c.Id == delId);
+            if (cat == null) return;
+            var kb = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("✅ Да, удалить", $"cat_del_confirm_{delId}"),
+                    InlineKeyboardButton.WithCallbackData("❌ Отмена",      "cat_del_cancel")
+                }
+            });
+            await bot.SendMessage(chatId,
+                $"Удалить категорию *{cat.Emoji} {cat.Name}*?",
+                parseMode: ParseMode.Markdown,
+                replyMarkup: kb, cancellationToken: ct);
+            return;
+        }
+
+        if (data.StartsWith("cat_del_confirm_") && int.TryParse(data[16..], out var confirmId))
+        {
+            await bot.DeleteMessage(chatId, callback.Message.MessageId, ct);
+            await _finance.DeleteCategoryAsync(userId, confirmId);
+            await bot.SendMessage(chatId, "✅ Категория удалена", cancellationToken: ct);
+            await SendCategoriesAsync(bot, chatId, userId, ct);
+            return;
+        }
+
+        if (data == "cat_del_cancel")
+        {
+            await bot.DeleteMessage(chatId, callback.Message.MessageId, ct);
+            return;
+        }
+
+        // --- Тип новой категории ---
+        if (data is "newcat_type_expense" or "newcat_type_income" or "newcat_type_both")
+        {
+            await bot.DeleteMessage(chatId, callback.Message.MessageId, ct);
+            var type = data switch
+            {
+                "newcat_type_income"  => CategoryType.Income,
+                "newcat_type_both"    => CategoryType.Both,
+                _                     => CategoryType.Expense
+            };
+            var name  = state.NewCategoryName ?? "Без названия";
+            var emoji = state.NewCategoryEmoji ?? "📁";
+            var cat = await _finance.CreateCategoryAsync(userId, name, emoji, type);
+            _conversation.Reset(chatId);
+            await bot.SendMessage(chatId,
+                $"✅ Категория *{cat.Emoji} {cat.Name}* добавлена!",
+                parseMode: ParseMode.Markdown, cancellationToken: ct);
+            await SendCategoriesAsync(bot, chatId, userId, ct);
+            return;
+        }
+
+        // --- Добавить счёт ---
+        if (data == "acc_add")
+        {
+            _conversation.Set(chatId, new ConversationState { Step = ConversationStep.WaitingForAccountName });
             await bot.SendMessage(chatId, "✏️ Введи название нового счёта:", cancellationToken: ct);
             return;
         }
 
-        // Добавить категорию
-        if (data == "add_category")
-        {
-            await bot.SendMessage(chatId, "🚧 Добавление категорий будет в следующей версии.", cancellationToken: ct);
-        }
+        // Заглушка для кнопок без действия
+        if (data == "cat_noop") return;
     }
 }

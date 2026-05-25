@@ -31,10 +31,7 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Создаём данные по умолчанию (счета, категории) при первом запуске
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var finance = scope.ServiceProvider.GetRequiredService<FinanceService>();
-        await finance.SeedDefaultDataAsync();
+        // Больше нет глобальных данных по умолчанию — данные создаются при регистрации пользователя
 
         // Проверяем что бот успешно подключён
         var me = await _bot.GetMe(stoppingToken);
